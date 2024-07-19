@@ -1,0 +1,2656 @@
+<?php
+
+namespace App\Http\Controllers\api\payments;
+
+use App\Http\Controllers\Controller;
+
+use App\Models\PaytabsInvoice;
+use Basel\Paytabs\Paytabs;
+use Illuminate\Http\Request;
+use GuzzleHttp\Client;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Crypt;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Facade;
+use Paytabscom\Laravel_paytabs\Facades\paypage;
+
+use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
+use Illuminate\Foundation\Bus\DispatchesJobs;
+use Illuminate\Foundation\Validation\ValidatesRequests;
+use App\Mail\UserActivated;
+use App\Models\Discount;
+use App\Models\Invoice\Invoice;
+use App\Models\User;
+use App\Models\SelectedPackage;
+use App\Models\Package;
+use App\Models\Delivery;
+use Carbon\Carbon;
+use Illuminate\Support\Facades\Validator;
+
+use DateTime;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Hash;
+use App\Models\Setting;
+use Illuminate\Support\Facades\Response;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+use App\Services\FourJawalyService;
+use Exception;
+
+class PaytabsApiController extends Controller
+{
+
+    // signup
+
+    public function paytabPayment(Request $request){
+
+        if (isset($request->lang) && $request->lang == 'ar') {
+            app()->setLocale('ar');
+        } else {
+            app()->setLocale('en');
+        }
+
+        try {
+
+            $validator = Validator::make($request->all(), [
+                'last_screen' => 'sometimes|string',
+                'lang' => 'required|string',
+                'user_id' => 'required|string',
+                'cart_id' => 'required|string',
+                'cart_currency' => 'required|string',
+                "discount_code"=> 'sometimes',
+                'cart_amount' => 'required',
+                'upcoming_package' => 'sometimes',
+                'add_meals' => 'sometimes',
+            ]);
+
+            if ($validator->fails()) {
+                return response()->json([
+                    'error' => 'Validation failed',
+                    'message' => $validator->errors(),
+                ], 400);
+            }
+
+            $user = User::where('id', $request->input('user_id'))->first();
+
+            if($user && $request->has('last_screen') && !empty($request->input('last_screen'))){
+                $user->last_screen = $request->input('last_screen');
+                $user->update();
+            }
+
+            $upcoming_package = 0;
+            $add_meal = 0;
+
+            if($request->upcoming_package){
+              $upcoming_package = 1;
+            }
+            if($request->add_meals){
+                $add_meal = 1;
+            }
+            
+            $selectedPackage = SelectedPackage::where('user_id', $request->input('user_id'))->first();
+
+            $status = 'pending';
+
+            if(isset($request->discount_code) && !empty($request->discount_code)){
+                $discount = Discount::where('code',$request->discount_code)->first();
+                $discount_id = (!empty($discount))?$discount->id:'';
+             }
+
+             $invoice = [];
+
+            $postData = [
+                'user_id' => $request->user_id,
+                'status' => $status,
+                'payment_status' => $status,
+                'payment_method' => "Paytab Payment",
+                'add_meals' => 0,
+                'upcoming_package' => 0,
+                'pt_invoice_id' => isset($responseData['tran_ref']) ? ('PT-'.$responseData['tran_ref']) : '',
+                'transaction_id' => isset($responseData['tran_ref']) ? $responseData['tran_ref'] : '',
+                'payment_id' => isset($responseData['tran_ref']) ? $responseData['tran_ref'] : '',
+                'created_at' => now()
+            ];
+        
+            if(isset($request->discount_code) && !empty($request->discount_code)){
+                $postData['discount_id'] = $discount_id;
+            }
+
+            $invoice = Invoice::create(
+                $postData
+            ); 
+
+         // Set your PayTabs profile ID and server key
+         $profileId = '139926';
+         $serverKey = 'S9J9NNNRJM-JHTHMDTT6H-KGL99LJJTT';
+ 
+         // API endpoint
+         $url = 'https://secure-global.paytabs.com/payment/request';
+ 
+         // Request data
+         $requestData = [
+             "profile_id" => $profileId,
+             "tran_type" => "auth",
+             "tran_class" => "ecom",
+             "cart_id" => $request->cart_id,
+             "cart_description" => "Food payment",
+             "cart_currency" => $request->cart_currency,
+             "cart_amount" => $request->cart_amount,
+             "callback" => url("/api/paytab/callback?invoice_id={$invoice->id}"),
+             "return" => url("/api/paytab/response?invoice_id={$invoice->id}")
+         ];
+ 
+         // Initialize cURL session
+         $ch = curl_init();
+ 
+         // Set cURL options
+         curl_setopt($ch, CURLOPT_URL, $url);
+         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+         curl_setopt($ch, CURLOPT_POST, true);
+         curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($requestData));
+         curl_setopt($ch, CURLOPT_HTTPHEADER, [
+             'Authorization: ' . $serverKey,
+             'Content-Type: application/json',
+         ]);
+ 
+         // Execute cURL request
+         $response = curl_exec($ch);
+ 
+         // Close cURL session
+         curl_close($ch);
+ 
+         // Handle the response
+         if ($response === false) {
+             // cURL error
+             $errorMessage = curl_error($ch);
+             return response()->json(['error' => $errorMessage], 500);
+         } else {
+             // Parse JSON response
+             $responseData = json_decode($response, true);
+             // Process the response data here
+
+           
+            Invoice::where('id', $invoice->id)->update([
+                'pt_invoice_id' => isset($responseData['tran_ref']) ? ('PT-'.$responseData['tran_ref']) : '',
+                'transaction_id' => isset($responseData['tran_ref']) ? $responseData['tran_ref'] : '',
+                'payment_id' => isset($responseData['tran_ref']) ? $responseData['tran_ref'] : '',
+            ]);
+
+            // Return a JSON response with the redirect URL.
+            return response()->json([
+                'redirect_url' => $responseData['redirect_url'],
+                'last_screen' => $user->last_screen
+            ]);
+         }
+
+        } catch (Exception $e) {
+            // Return a JSON response with the error message.
+            return response()->json([
+                'error' => $e->getMessage(),
+            ], 400);
+        }
+  
+    }
+
+    public function paytabsResponse(Request $request){
+           $lang = 'en';
+   
+           if (isset($request->lang) && $request->lang == 'ar') {
+               app()->setLocale('ar');
+               $lang = 'ar';
+           } else {
+               app()->setLocale('en');
+           }
+   
+           try {
+               $id = $request->invoice_id;
+               $getUser = Invoice::where('id', $id)->first();
+               $user_id = $getUser->user_id;
+   
+               $user = User::findOrFail($user_id);
+                 
+               if (empty($user)) {
+                   if (isset($request->lang) && $request->lang == 'ar') {
+                       return response()->json([
+                           "status" => false,
+                           "message" => "?? ??? ?????? ??? ????????."
+                       ]);
+                   } else {
+                       return response()->json([
+                           "status" => false,
+                           "message" => "User not found."
+                       ]);
+                   }
+               }
+   
+               if (!empty($user)) {
+                   $user->last_screen = $request->last_screen;
+                   $user->update();
+               }
+
+               // Set your PayTabs profile ID and server key
+                $profileId = '139926';
+                $serverKey = 'S9J9NNNRJM-JHTHMDTT6H-KGL99LJJTT';
+
+                // API endpoint
+                $url = 'https://secure-global.paytabs.com/payment/query';
+
+                // Transaction reference
+                $tranRef = $getUser->transaction_id;
+
+                $data = array(
+                    "profile_id" => $profileId,
+                    "tran_ref" => $getUser->transaction_id
+                );
+                
+                // Convert data to JSON format
+                $postData = json_encode($data);
+                
+                // URL to send the request to
+                $url = "https://secure-global.paytabs.com/payment/query";
+                
+                // Set up cURL
+                $ch = curl_init($url);
+                
+                // Set up options for cURL
+                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "POST");
+                curl_setopt($ch, CURLOPT_POSTFIELDS, $postData);
+                curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+                    "Content-Type: application/json",
+                    "Authorization: ".$serverKey
+                ));
+                
+                // Execute the request and get the response
+                $response = curl_exec($ch);
+                $responseData = [];
+
+                // Check for errors
+                if ($response === false) {
+                    $error = curl_error($ch);
+                    // Handle cURL error
+                    echo "cURL Error: " . $error;
+                } else {
+                    // Decode the JSON response
+                    $responseData = json_decode($response, true);
+                    // Process the response data as needed
+                }
+
+                if($responseData['payment_result']['response_status'] == 'C'){
+                    // payment canceled  
+                    return response()->json([
+                        "status" => false,
+                        "message" => "Payment canceled."
+                    ]);
+                }
+   
+                if($responseData['payment_result']['response_status'] == 'D'){
+
+                    // Card security code (CVV) mismatch
+                    return response()->json([
+                        "status" => false,
+                        "message" => "Card security code (CVV) mismatch. Please try again after some time."
+                    ]);
+                }
+   
+               $created_at = Carbon::parse($responseData['payment_result']['transaction_time']);
+               $created_at = $created_at->format('Y-m-d');
+   
+               $selectedPackage = SelectedPackage::where('user_id', $user_id)->first();
+               $pendingInvoice = Invoice::where('id', $id)->first();
+   
+               $today = Carbon::now()->toDateString();
+   
+               if($pendingInvoice['upcoming_package'] == 0){
+                  
+                   $status = 'soon';
+              
+               if(!empty($selectedPackage->subscription_start)){
+                   if($today == Carbon::parse($selectedPackage->subscription_start)->format('Y-m-d')){
+                      $status = 'active';
+                   }
+               }
+   
+               $invoice = Invoice::updateOrCreate(
+                   ['id' => $id],
+                   [
+                       'user_id' => $user_id,
+                       'status' => $status,
+                       'payment_status' => $status,
+                       'amount' => isset($responseData['tran_total']) ? $responseData['tran_total'] : 0,
+                       'package_id' => $user->package_id,
+                       'currency' => $responseData['tran_currency'],
+                       'starting_date' => !empty($selectedPackage->subscription_start) ? Carbon::parse($selectedPackage->subscription_start)->format('Y-m-d') : NULL,
+                       'subscription_start' => isset($selectedPackage->subscription_start) ? Carbon::parse($selectedPackage->subscription_start)->format('Y-m-d') : NULL,
+                       'subscription_end' => isset($selectedPackage->subscription_ends) ? Carbon::parse($selectedPackage->subscription_ends)->format('Y-m-d') : NULL,
+                       'created_at' => isset($responseData['payment_result']['transaction_time']) ? $responseData['payment_result']['transaction_time'] : '',
+                       'is_payment_success' => 1
+                   ]
+               );
+   
+               } else {
+   
+                   if(!empty($selectedPackage->upcoming_packages)){
+   
+                       $upcoming_package = [];
+   
+                       if(!empty($selectedPackage->upcoming_packages)) {
+                       $upcoming_package = json_decode($selectedPackage->upcoming_packages,true);
+                       $upcoming_package = $upcoming_package[0];
+                       }
+   
+                       $subscriptionStartDate = $upcoming_package['subscription_start'];
+   
+                       $status = 'soon';
+                  if(!empty($subscriptionStartDate)){
+                       if($today == Carbon::parse($subscriptionStartDate)->format('Y-m-d')){
+                          $status = 'active';
+                       }
+                   }
+   
+                   $invoice = Invoice::updateOrCreate(
+                       ['id' => $id],
+                       [
+                        'user_id' => $user_id,
+                        'status' => $status,
+                        'payment_status' => $status,
+                        'amount' => isset($responseData['tran_total']) ? $responseData['tran_total'] : 0,
+                        'package_id' => $user->package_id,
+                        'currency' => $responseData['tran_currency'],
+                        'starting_date' => !empty($selectedPackage->subscription_start) ? Carbon::parse($selectedPackage->subscription_start)->format('Y-m-d') : NULL,
+                        'subscription_start' => isset($selectedPackage->subscription_start) ? Carbon::parse($selectedPackage->subscription_start)->format('Y-m-d') : NULL,
+                        'subscription_end' => isset($selectedPackage->subscription_ends) ? Carbon::parse($selectedPackage->subscription_ends)->format('Y-m-d') : NULL,
+                        'created_at' => isset($responseData['payment_result']['transaction_time']) ? $responseData['payment_result']['transaction_time'] : '',
+                        'is_payment_success' => 1
+                       ]
+                   );
+   
+                   }
+                   
+               }
+   
+               if(empty($user->password) || $user->password == NULL || $user->password == null){
+   
+                       $randomString = Str::random(8);
+                       $this->sendPassWord($user->phone,$randomString,$request->lang);
+                       $user->password = Hash::make($randomString);
+               }
+   
+               $user->is_confirm = 1;
+               $user->signup_complete = 1;
+   
+               $user->update();
+   
+               Invoice::where('id',$id)->update(['is_payment_success' => 1]);
+   
+               return view('web.subscription.paytabsPayment.success', compact('lang'));
+             
+           } catch (Exception $e) {
+               // Return a generic error response.
+               return response()->json([
+                   'status' => false,
+                   'error' => $e->getMessage(),
+               ], 500);
+           }
+   
+           app()->setLocale('en');
+       
+    }
+
+     // signup
+
+     public function sendPassWord($phone,$randomString,$lang)
+     {
+         try {
+             
+             if(!empty($lang) && $lang == 'ar'){
+             $message = trans("message.temporaryPassword").$randomString;
+             }else{
+             $message = "Welcome to Ghithaa! Your temporary login password: ".$randomString;
+             }
+             try {
+                 $fourJawalyService = new FourJawalyService();
+                 $fourJawalyService->sendSMS(ltrim($phone, 0), $message);
+                 // save otp to the user table
+                 return true;
+             } catch (Exception $e) {
+                 Log::error("Error sending SMS: " . $e->getMessage());
+             }
+             
+         } catch (Exception $exception) {
+             # by pass the error
+             report($exception);
+         } 
+     }
+
+     // signup
+
+    public function paytabsCallback(Request $request){
+
+        $lang = 'en';
+   
+           if (isset($request->lang) && $request->lang == 'ar') {
+               app()->setLocale('ar');
+               $lang = 'ar';
+           } else {
+               app()->setLocale('en');
+           }
+
+           try {
+                   $id = $request->invoice_id;
+                   $getUser = Invoice::where('id', $id)->first();
+                   if(isset($getUser->user_id)){
+                   $user_id = $getUser->user_id;
+       
+                   $user = User::findOrFail($user_id);
+                     
+                   if (empty($user)) {
+                       if (isset($request->lang) && $request->lang == 'ar') {
+                           return response()->json([
+                               "status" => false,
+                               "message" => "?? ??? ?????? ??? ????????."
+                           ]);
+                       } else {
+                           return response()->json([
+                               "status" => false,
+                               "message" => "User not found."
+                           ]);
+                       }
+                   }
+                }
+       
+                   if (!empty($user)) {
+                       $user->last_screen = $request->last_screen;
+                       $user->update();
+                   }
+    
+                   // Set your PayTabs profile ID and server key
+                    $profileId = '139926';
+                    $serverKey = 'S9J9NNNRJM-JHTHMDTT6H-KGL99LJJTT';
+    
+                    // API endpoint
+                    $url = 'https://secure-global.paytabs.com/payment/query';
+    
+                    if(isset($getUser->transaction_id)){
+                    // Transaction reference
+                    $tranRef = $getUser->transaction_id;
+    
+                    $data = array(
+                        "profile_id" => $profileId,
+                        "tran_ref" => $getUser->transaction_id
+                    );
+                    
+                    // Convert data to JSON format
+                    $postData = json_encode($data);
+                    
+                    // URL to send the request to
+                    $url = "https://secure-global.paytabs.com/payment/query";
+                    
+                    // Set up cURL
+                    $ch = curl_init($url);
+                    
+                    // Set up options for cURL
+                    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "POST");
+                    curl_setopt($ch, CURLOPT_POSTFIELDS, $postData);
+                    curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+                        "Content-Type: application/json",
+                        "Authorization: ".$serverKey
+                    ));
+                    
+                    // Execute the request and get the response
+                    $response = curl_exec($ch);
+                    $responseData = [];
+    
+                    // Check for errors
+                    if ($response === false) {
+                        $error = curl_error($ch);
+                        // Handle cURL error
+                        echo "cURL Error: " . $error;
+                    } else {
+                        // Decode the JSON response
+                        $responseData = json_decode($response, true);
+                        // Process the response data as needed
+                    }
+                }
+    
+                    if(isset($responseData['payment_result']['response_status']) && $responseData['payment_result']['response_status'] == 'C'){
+                        // payment canceled  
+                        return response()->json([
+                            "status" => false,
+                            "message" => "Payment canceled."
+                        ]);
+                    }
+       
+                    if(isset($responseData['payment_result']['response_status']) && $responseData['payment_result']['response_status'] == 'D'){
+                        // Card security code (CVV) mismatch
+                        return response()->json([
+                            "status" => false,
+                            "message" => "Card security code (CVV) mismatch. Please try again after some time."
+                        ]);
+                    }
+       
+
+            return response()->json([
+                "status" => true,
+                "message" => "You can navigate back to the app.",
+                'last_screen' => $user->last_screen,
+
+            ]);
+             
+        } catch (Exception $e) {
+            // Return a generic error response.
+            return response()->json([
+                'status' => false,
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+
+        app()->setLocale('en');
+    }
+
+    // signup
+
+    public function getPaytabInvoice(Request $request)
+    {
+        if (isset($request->lang) && $request->lang == 'ar') {
+            app()->setLocale('ar');
+        } else {
+            app()->setLocale('en');
+        }
+
+        try {
+
+            $id = $request->user_id;
+
+            $user = User::findOrFail($id);
+
+            if (empty($user)) {
+                if (isset($request->lang) && $request->lang == 'ar') {
+                    return response()->json([
+                        "status" => false,
+                        "message" => "?? ??? ?????? ??? ????????."
+                    ]);
+                } else {
+                    return response()->json([
+                        "status" => false,
+                        "message" => "User not found."
+                    ]);
+                }
+            }
+
+            if (!empty($user)) {
+                $user->last_screen = $request->last_screen;
+                $user->update();
+            }
+
+            $invoice = Invoice::where('user_id', $id)->where('upcoming_package', 0)->latest()->first();
+
+            if (empty($invoice)) {
+                if (isset($request->lang) && $request->lang == 'ar') {
+                    return response()->json([
+                        "status" => false,
+                        "message" => "?? ??? ?????? ??? ?????? ????????."
+                    ]);
+                } else {
+                    return response()->json([
+                        "status" => false,
+                        "message" => "User's invoice not found."
+                    ]);
+                }
+            }
+
+            $selectedPackages = SelectedPackage::where('user_id', $request->user_id)->first();
+
+            if (isset($request->lang) && $request->lang == 'ar') {
+                return response()->json([
+                    "status" => true,
+                    "message" => "??? ??? ????? ????? ?????? ?? ?????. ????? ????? ??? ?????? ??????? ??? ???????.",
+                    'invoice_info' => $invoice,
+                    'user_info' => $user,
+                    'last_screen' => $user->last_screen,
+                ]);
+            } else {
+                return response()->json([
+                    "status" => true,
+                    "message" => "Your payment has been done successfully. You can close this page and go back to app.",
+                    'invoice_info' => $invoice,
+                    'user_info' => $user,
+                    'last_screen' => $user->last_screen,
+                ]);
+            }
+
+        } catch (Exception $e) {
+            // Return a generic error response.
+            return response()->json([
+                'status' => false,
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+
+        app()->setLocale('en');
+    }
+
+
+    /// extend package paytab payment
+
+    public function extendPackagePaytabPayment(Request $request)
+    {
+        if (isset($request->lang) && $request->lang == 'ar') {
+            app()->setLocale('ar');
+        } else {
+            app()->setLocale('en');
+        }
+
+        try {
+
+            $validator = Validator::make($request->all(), [
+                'last_screen' => 'sometimes|string',
+                'lang' => 'required|string',
+                'user_id' => 'required|string',
+                'cart_id' => 'required|string',
+                'cart_currency' => 'required|string',
+                "discount_code"=> 'sometimes',
+                'cart_amount' => 'required',
+                'package_id' => 'sometimes|integer',
+                'start_date'=> ['sometimes']
+            ]);
+
+            if ($validator->fails()) {
+                return response()->json([
+                    'error' => 'Validation failed',
+                    'message' => $validator->errors(),
+                ], 400);
+            }
+            
+            if(empty($request->package_id)){
+                return response()->json([
+                    "status" => false,
+                    "message" => "Package id not found."
+                ]);
+            }
+            if(empty($request->start_date)){
+                return response()->json([
+                    "status" => false,
+                    "message" => "Start date not found."
+                ]);
+            }
+
+            $user = User::where('id', $request->input('user_id'))->first();
+
+            if($user && $request->has('last_screen') && !empty($request->input('last_screen'))){
+                $user->last_screen = $request->input('last_screen');
+                $user->update();
+            }
+
+            $selectedPackage = SelectedPackage::where('user_id', $request->input('user_id'))->first();
+            if(empty($selectedPackage)){
+                return response()->json([
+                    'status' => false,
+                    'message' => 'User package Not found',
+                    'upcoming_packages' => null,
+                    'package_info' => null
+                ], 200);
+            }
+            
+            $status = 'pending';
+
+            $deliveries = Delivery::where('user_id', $request->input('user_id'))->first();
+
+            if(isset($request->discount_code) && !empty($request->discount_code)){
+                $discount = Discount::where('code',$request->discount_code)->first();
+                $discount_id = (!empty($discount))?$discount->id:'';
+             }
+
+             $invoice = [];
+
+            $postData = [
+                'user_id' => $request->user_id,
+                'status' => $status,
+                'payment_status' => $status,
+                'payment_method' => "Paytab Payment",
+                'add_meals' => 0,
+                'upcoming_package' => 1,
+                'pt_invoice_id' => isset($responseData['tran_ref']) ? ('PT-'.$responseData['tran_ref']) : '',
+                'transaction_id' => isset($responseData['tran_ref']) ? $responseData['tran_ref'] : '',
+                'payment_id' => isset($responseData['tran_ref']) ? $responseData['tran_ref'] : '',
+                'created_at' => now()
+            ];
+        
+            if(isset($request->discount_code) && !empty($request->discount_code)){
+                $postData['discount_id'] = $discount_id;
+            }
+
+            $invoice = Invoice::create(
+                $postData
+            ); 
+
+         // Set your PayTabs profile ID and server key
+         $profileId = '139926';
+         $serverKey = 'S9J9NNNRJM-JHTHMDTT6H-KGL99LJJTT';
+ 
+         // API endpoint
+         $url = 'https://secure-global.paytabs.com/payment/request';
+ 
+         // Request data
+         $requestData = [
+             "profile_id" => $profileId,
+             "tran_type" => "auth",
+             "tran_class" => "ecom",
+             "cart_id" => $request->cart_id,
+             "cart_description" => "Food payment",
+             "cart_currency" => $request->cart_currency,
+             "cart_amount" => $request->cart_amount,
+             "callback" => url("/api/paytab/extendPackage/callback?invoice_id={$invoice->id}"),
+             "return" => url("/api/paytab/extendPackage/response?invoice_id={$invoice->id}")
+         ];
+ 
+         // Initialize cURL session
+         $ch = curl_init();
+ 
+         // Set cURL options
+         curl_setopt($ch, CURLOPT_URL, $url);
+         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+         curl_setopt($ch, CURLOPT_POST, true);
+         curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($requestData));
+         curl_setopt($ch, CURLOPT_HTTPHEADER, [
+             'Authorization: ' . $serverKey,
+             'Content-Type: application/json',
+         ]);
+ 
+         // Execute cURL request
+         $response = curl_exec($ch);
+ 
+         // Close cURL session
+         curl_close($ch);
+ 
+         // Handle the response
+         if ($response === false) {
+             // cURL error
+             $errorMessage = curl_error($ch);
+             return response()->json(['error' => $errorMessage], 500);
+         } else {
+             // Parse JSON response
+             $responseData = json_decode($response, true);
+             // Process the response data here
+
+             Invoice::where('id', $invoice->id)->update([
+                'pt_invoice_id' => isset($responseData['tran_ref']) ? ('PT-'.$responseData['tran_ref']) : '',
+                'transaction_id' => isset($responseData['tran_ref']) ? $responseData['tran_ref'] : '',
+                'payment_id' => isset($responseData['tran_ref']) ? $responseData['tran_ref'] : '',
+            ]);
+
+            $upcoming_package = [];
+
+            if(!empty($selectedPackage->upcoming_packages)) {
+            $upcoming_package = json_decode($selectedPackage->upcoming_packages,true);
+            $upcoming_package = $upcoming_package[0];
+            }
+
+        if ($upcoming_package != NULL) {
+            return response()->json([
+                'status' => false,
+                'message' => "Already added an upcoming package."
+            ]);
+        } 
+
+        if($invoice->id){
+
+            // fetch package information from package table
+            // fetch days , package id , package name 
+           
+            $existPackage = SelectedPackage::where('user_id', $request->user_id)->first();
+
+            $upcomingPackages = [];
+
+                    $packageId = Package::where('id', $request->input('package_id'))->first();
+                    if (!empty($packageId)) {
+
+                        $totalMeals = '';
+                        if(is_string($packageId->total_meals)){
+                            $totalMeals = json_decode($packageId->total_meals, true);
+                        }
+                        if(!empty($totalMeals) && is_string($totalMeals)){
+                            $totalMeals = json_decode($totalMeals, true);
+                        }
+                        if(!empty($totalMeals) && is_object($totalMeals)){
+                            $totalMeals = (array) $totalMeals;
+                        }else if(is_object($packageId->total_meals))
+                        {
+                            $totalMeals = (array) $packageId->total_meals;
+                        }
+
+                        if($packageId->is_custome_package ==0){
+                            $upcomingPackageWithIds = [
+                                'package_id' => $packageId->id,
+                                'package_name' => $packageId->name,
+                                'total_meals' => json_encode($totalMeals),
+                                'total_calories' => $packageId->total_calories, //
+                                'days' => $packageId->total_days,
+                                'total_price' => array_sum((array) $packageId->price), //
+                                'price' => array_sum((array) $packageId->price) // 
+                            ];
+                        }else{
+                            $upcomingPackageWithIds = [
+                                'package_id' => $packageId->id,
+                                'package_name' => $packageId->name,
+                                'total_meals' => json_encode($totalMeals),
+                                'total_calories' => $packageId->calories, //
+                                'days' => $packageId->total_days,
+                                'total_price' => array_sum((array) $packageId->price), //
+                                'price' => array_sum((array) $packageId->price) // 
+                            ];
+                        }
+                        
+                        // Append the $upcomingPackage array to $upcomingPackages
+                        $upcomingPackages[] = $upcomingPackageWithIds;
+                    } else {
+                        return response()->json([
+                            'status' => false,
+                            'message' => 'no package found'
+                        ], 404);
+                    }
+                
+
+                // Calculate the subscription ends date according to subscription start date and days from request
+                $subscriptionStartDate = Carbon::createFromFormat('d-m-y', $request->input('start_date'));
+                    
+                $days = $packageId->total_days;   
+                $delivery_time = $deliveries->time_of_delivery;
+                $deliveryDays = $deliveries->delivery_days;
+
+                $skippedWeekdays = array_filter(array_keys($deliveryDays), function ($day) use ($deliveryDays) {
+                    return !($deliveryDays[$day]['val']['first'] === true);
+                });
+
+                $dayNames = array_column($deliveryDays, 'key');
+                $skippedWeekdays = array_map(function ($numericDay) use ($dayNames) {
+                    return $dayNames[$numericDay];
+                }, $skippedWeekdays);
+
+                $subscriptionEndsDate = $subscriptionStartDate->copy();
+                $deliveryCount = $days;
+
+                while ($deliveryCount > 1) {
+                    $subscriptionEndsDate->addDay();
+
+                    if (in_array($subscriptionEndsDate->englishDayOfWeek, $skippedWeekdays)) {
+                        continue;
+                    }
+
+                    $deliveryCount--;
+                }
+    
+                $subscriptionEndsDateFormatted = $subscriptionEndsDate->format('d-m-Y');
+                $subscriptionStartDateFormatted = $subscriptionStartDate->format('d-m-Y');
+
+                $upcomingPackagesDeliveryData = [
+                    'upcoming_subscription_start' => $subscriptionStartDateFormatted,
+                    'upcoming_subscription_end' => $subscriptionEndsDateFormatted,
+                    'upcoming_subscription_delivery_time' => $delivery_time,
+                    'upcoming_subscription_delivery_days' => $deliveryDays,
+                    'upcoming_subscription_days' => $days,
+                ];
+
+
+                $selectedPackage = SelectedPackage::where('user_id', $request->user_id)->first();
+
+                $getPackage = Package::where('id', $selectedPackage['package_id'])->get();
+
+                // information for subscription details
+                $upcomingPackagesDeliveryData = [
+                    'delivery_days' => count($getPackage[0]->days),
+                    'total_days' => $getPackage[0]->total_days,
+                    'subscription_start' => $subscriptionStartDateFormatted,
+                    'subscription_ends' => $subscriptionEndsDateFormatted,
+                    'expired_on' => $subscriptionEndsDateFormatted,
+                    'invoice_id' => $invoice->id,
+                    'is_upcoming' => 1,
+                ];
+
+                // Initialize an array to store merged data
+                $mergedPackages = [];
+
+                foreach ($upcomingPackages as $upcomingPackage) {
+                    // Merge each $upcomingPackage with $upcomingPackagesDeliveryData
+                    $mergedPackage = array_merge($upcomingPackage, $upcomingPackagesDeliveryData);
+
+                    // Add the merged package to the new array
+                    $mergedPackages[] = $mergedPackage;
+                }
+            
+            $existPackage->upcoming_packages = $mergedPackages;
+            $existPackage->save();
+
+        
+            $invoice->update([
+                'starting_date' => Carbon::parse($subscriptionStartDateFormatted)->format('Y-m-d'),
+                'subscription_start' => $subscriptionStartDateFormatted,
+                'subscription_end' => $subscriptionEndsDateFormatted,
+            ]);
+
+        }
+
+            // Return a JSON response with the redirect URL.
+            return response()->json([
+                'redirect_url' => $responseData['redirect_url'],
+                'last_screen' => $user->last_screen,
+            ]);
+         }
+
+
+        } catch (Exception $e) {
+            // Return a JSON response with the error message.
+            return response()->json([
+                'error' => $e->getMessage(),
+            ], 400);
+        }
+    }
+
+    // extend package paytab payment
+
+    public function paytabsExtendPackageResponse(Request $request){
+               $lang = 'en';
+       
+               if (isset($request->lang) && $request->lang == 'ar') {
+                   app()->setLocale('ar');
+                   $lang = 'ar';
+               } else {
+                   app()->setLocale('en');
+               }
+       
+               try {
+                   $id = $request->invoice_id;
+                   $getUser = Invoice::where('id', $id)->first();
+                   $user_id = $getUser->user_id;
+       
+                   $user = User::findOrFail($user_id);
+                     
+                   if (empty($user)) {
+                       if (isset($request->lang) && $request->lang == 'ar') {
+                           return response()->json([
+                               "status" => false,
+                               "message" => "?? ??? ?????? ??? ????????."
+                           ]);
+                       } else {
+                           return response()->json([
+                               "status" => false,
+                               "message" => "User not found."
+                           ]);
+                       }
+                   }
+       
+                   if (!empty($user)) {
+                       $user->last_screen = $request->last_screen;
+                       $user->update();
+                   }
+    
+                   // Set your PayTabs profile ID and server key
+                    $profileId = '139926';
+                    $serverKey = 'S9J9NNNRJM-JHTHMDTT6H-KGL99LJJTT';
+    
+                    // API endpoint
+                    $url = 'https://secure-global.paytabs.com/payment/query';
+    
+                    // Transaction reference
+                    $tranRef = $getUser->transaction_id;
+    
+                    $data = array(
+                        "profile_id" => $profileId,
+                        "tran_ref" => $getUser->transaction_id
+                    );
+                    
+                    // Convert data to JSON format
+                    $postData = json_encode($data);
+                    
+                    // URL to send the request to
+                    $url = "https://secure-global.paytabs.com/payment/query";
+                    
+                    // Set up cURL
+                    $ch = curl_init($url);
+                    
+                    // Set up options for cURL
+                    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "POST");
+                    curl_setopt($ch, CURLOPT_POSTFIELDS, $postData);
+                    curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+                        "Content-Type: application/json",
+                        "Authorization: ".$serverKey
+                    ));
+                    
+                    // Execute the request and get the response
+                    $response = curl_exec($ch);
+                    $responseData = [];
+    
+                    // Check for errors
+                    if ($response === false) {
+                        $error = curl_error($ch);
+                        // Handle cURL error
+                        echo "cURL Error: " . $error;
+                    } else {
+                        // Decode the JSON response
+                        $responseData = json_decode($response, true);
+                        // Process the response data as needed
+                    }
+    
+                    if($responseData['payment_result']['response_status'] == 'C'){
+                        // payment canceled  
+                        return response()->json([
+                            "status" => false,
+                            "message" => "Payment canceled."
+                        ]);
+                    }
+       
+                    if($responseData['payment_result']['response_status'] == 'D'){
+
+                        // Card security code (CVV) mismatch
+                        return response()->json([
+                            "status" => false,
+                            "message" => "Card security code (CVV) mismatch. Please try again after some time."
+                        ]);
+                    }
+       
+                   $created_at = Carbon::parse($responseData['payment_result']['transaction_time']);
+                   $created_at = $created_at->format('Y-m-d');
+       
+                   $selectedPackage = SelectedPackage::where('user_id', $user_id)->first();
+                   $pendingInvoice = Invoice::where('id', $id)->first();
+       
+                   $today = Carbon::now()->toDateString();
+       
+                   if($pendingInvoice['upcoming_package'] == 0){
+                      
+                       $status = 'soon';
+       
+                   if(!empty($selectedPackage->subscription_start)){
+                       if($today == Carbon::parse($selectedPackage->subscription_start)->format('Y-m-d')){
+                          $status = 'active';
+                       }
+                   }
+       
+                   $invoice = Invoice::updateOrCreate(
+                       ['id' => $id],
+                       [
+                           'user_id' => $user_id,
+                           'status' => $status,
+                           'payment_status' => $status,
+                           'amount' => isset($responseData['tran_total']) ? $responseData['tran_total'] : 0,
+                           'package_id' => $user->package_id,
+                           'currency' => $responseData['tran_currency'],
+                           'starting_date' => !empty($selectedPackage->subscription_start) ? Carbon::parse($selectedPackage->subscription_start)->format('Y-m-d') : NULL,
+                           'subscription_start' => isset($selectedPackage->subscription_start) ? Carbon::parse($selectedPackage->subscription_start)->format('Y-m-d') : NULL,
+                           'subscription_end' => isset($selectedPackage->subscription_ends) ? Carbon::parse($selectedPackage->subscription_ends)->format('Y-m-d') : NULL,
+                           'created_at' => isset($responseData['payment_result']['transaction_time']) ? $responseData['payment_result']['transaction_time'] : '',
+                       ]
+                   );
+       
+                   } else {
+       
+                       if(!empty($selectedPackage->upcoming_packages)){
+       
+                           $upcoming_package = [];
+       
+                           if(!empty($selectedPackage->upcoming_packages)) {
+                           $upcoming_package = json_decode($selectedPackage->upcoming_packages,true);
+                           $upcoming_package = $upcoming_package[0];
+                           }
+       
+                           $subscriptionStartDate = $upcoming_package['subscription_start'];
+       
+                           $status = 'soon';
+                      if(!empty($subscriptionStartDate)){
+                           if($today == Carbon::parse($subscriptionStartDate)->format('Y-m-d')){
+                              $status = 'active';
+                           }
+                       }
+       
+                       $invoice = Invoice::updateOrCreate(
+                           ['id' => $id],
+                           [
+                            'user_id' => $user_id,
+                            'status' => $status,
+                            'payment_status' => $status,
+                            'amount' => isset($responseData['tran_total']) ? $responseData['tran_total'] : 0,
+                            'package_id' => $user->package_id,
+                            'currency' => $responseData['tran_currency'],
+                            'starting_date' => !empty($selectedPackage->subscription_start) ? Carbon::parse($selectedPackage->subscription_start)->format('Y-m-d') : NULL,
+                            'subscription_start' => isset($selectedPackage->subscription_start) ? Carbon::parse($selectedPackage->subscription_start)->format('Y-m-d') : NULL,
+                            'subscription_end' => isset($selectedPackage->subscription_ends) ? Carbon::parse($selectedPackage->subscription_ends)->format('Y-m-d') : NULL,
+                            'created_at' => isset($responseData['payment_result']['transaction_time']) ? $responseData['payment_result']['transaction_time'] : '',
+                           ]
+                       );
+       
+                       }
+                       
+                   }
+       
+                   Invoice::where('id',$id)->update(['is_payment_success_extend_package' => 1]);
+       
+                   return view('web.subscription.paytabsPayment.success', compact('lang'));
+                 
+               } catch (Exception $e) {
+                   // Return a generic error response.
+                   return response()->json([
+                       'status' => false,
+                       'error' => $e->getMessage(),
+                   ], 500);
+               }
+       
+               app()->setLocale('en');
+           
+        }
+
+    // extend package paytab payment
+
+    public function paytabsExtendPackageCallback(Request $request){
+
+        $lang = 'en';
+   
+           if (isset($request->lang) && $request->lang == 'ar') {
+               app()->setLocale('ar');
+               $lang = 'ar';
+           } else {
+               app()->setLocale('en');
+           }
+
+           try {
+                   $id = $request->invoice_id;
+                   $getUser = Invoice::where('id', $id)->first();
+                   if(isset($getUser->user_id)){
+                   $user_id = $getUser->user_id;
+       
+                   $user = User::findOrFail($user_id);
+                     
+                   if (empty($user)) {
+                       if (isset($request->lang) && $request->lang == 'ar') {
+                           return response()->json([
+                               "status" => false,
+                               "message" => "?? ??? ?????? ??? ????????."
+                           ]);
+                       } else {
+                           return response()->json([
+                               "status" => false,
+                               "message" => "User not found."
+                           ]);
+                       }
+                   }
+                }
+       
+                   if (!empty($user)) {
+                       $user->last_screen = $request->last_screen;
+                       $user->update();
+                   }
+    
+                   // Set your PayTabs profile ID and server key
+                    $profileId = '139926';
+                    $serverKey = 'S9J9NNNRJM-JHTHMDTT6H-KGL99LJJTT';
+    
+                    // API endpoint
+                    $url = 'https://secure-global.paytabs.com/payment/query';
+    
+                    if(isset($getUser->transaction_id)){
+                    // Transaction reference
+                    $tranRef = $getUser->transaction_id;
+    
+                    $data = array(
+                        "profile_id" => $profileId,
+                        "tran_ref" => $getUser->transaction_id
+                    );
+                    
+                    // Convert data to JSON format
+                    $postData = json_encode($data);
+                    
+                    // URL to send the request to
+                    $url = "https://secure-global.paytabs.com/payment/query";
+                    
+                    // Set up cURL
+                    $ch = curl_init($url);
+                    
+                    // Set up options for cURL
+                    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "POST");
+                    curl_setopt($ch, CURLOPT_POSTFIELDS, $postData);
+                    curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+                        "Content-Type: application/json",
+                        "Authorization: ".$serverKey
+                    ));
+                    
+                    // Execute the request and get the response
+                    $response = curl_exec($ch);
+                    $responseData = [];
+    
+                    // Check for errors
+                    if ($response === false) {
+                        $error = curl_error($ch);
+                        // Handle cURL error
+                        echo "cURL Error: " . $error;
+                    } else {
+                        // Decode the JSON response
+                        $responseData = json_decode($response, true);
+                        // Process the response data as needed
+                    }
+                }
+    
+                    if(isset($responseData['payment_result']['response_status']) && $responseData['payment_result']['response_status'] == 'C'){
+                        // payment canceled  
+                        return response()->json([
+                            "status" => false,
+                            "message" => "Payment canceled."
+                        ]);
+                    }
+       
+                    if(isset($responseData['payment_result']['response_status']) && $responseData['payment_result']['response_status'] == 'D'){
+                        // Card security code (CVV) mismatch
+                        return response()->json([
+                            "status" => false,
+                            "message" => "Card security code (CVV) mismatch. Please try again after some time."
+                        ]);
+                    }
+       
+
+            return response()->json([
+                "status" => true,
+                "message" => "You can navigate back to the app.",
+                'last_screen' => $user->last_screen,
+            ]);
+             
+        } catch (Exception $e) {
+            // Return a generic error response.
+            return response()->json([
+                'status' => false,
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+
+        app()->setLocale('en');
+    }
+
+    // extend package paytab payment
+
+    public function getextendPackagePaytabInvoice(Request $request)
+    {
+        if (isset($request->lang) && $request->lang == 'ar') {
+            app()->setLocale('ar');
+        } else {
+            app()->setLocale('en');
+        }
+
+        try {
+
+            $id = $request->user_id;
+        
+            $user = User::findOrFail($id);
+
+            if (empty($user)) {
+                if (isset($request->lang) && $request->lang == 'ar') {
+                    return response()->json([
+                        "status" => false,
+                        "message" => "?? ??? ?????? ??? ????????.",
+                        'invoice_info' => ['is_payment_success_extend_package'=>0]
+                    ]);
+                } else {
+                    return response()->json([
+                        "status" => false,
+                        "message" => "User not found.",
+                        'invoice_info' => ['is_payment_success_extend_package'=>0]
+                    ]);
+                }
+            }
+
+            if (!empty($user)) {
+                $user->last_screen = $request->last_screen;
+                $user->update();
+            }
+
+            $invoice = Invoice::where('user_id', $id)->where('upcoming_package',1)->latest()->first();
+
+            if (empty($invoice)) {
+                if (isset($request->lang) && $request->lang == 'ar') {
+                    return response()->json([
+                        "status" => false,
+                        "message" => "?? ??? ?????? ??? ?????? ????????.",
+                        'invoice_info' => ['is_payment_success_extend_package'=>0]
+                    ]);
+                } else {
+                    return response()->json([
+                        "status" => false,
+                        "message" => "User's invoice not found.",
+                        'invoice_info' => ['is_payment_success_extend_package'=>0]
+                    ]);
+                }
+            }
+
+            $selectedPackages = SelectedPackage::where('user_id', $request->user_id)->first();
+
+            if (isset($request->lang) && $request->lang == 'ar') {
+                return response()->json([
+                    "status" => true,
+                    "message" => "??? ??? ????? ????? ?????? ?? ?????. ????? ????? ??? ?????? ??????? ??? ???????.",
+                    'invoice_info' => $invoice,
+                    'user_info' => $user,
+                    'last_screen' => $user->last_screen,
+                ]);
+            } else {
+                return response()->json([
+                    "status" => true,
+                    "message" => "Your payment has been done successfully. You can close this page and go back to app.",
+                    'invoice_info' => $invoice,
+                    'user_info' => $user,
+                    'last_screen' => $user->last_screen,
+                ]);
+            }
+
+        } catch (Exception $e) {
+            // Return a generic error response.
+            return response()->json([
+                'status' => false,
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+
+        app()->setLocale('en');
+    }
+
+
+     // renew
+
+     public function renewPaytabPayment(Request $request){
+
+        if (isset($request->lang) && $request->lang == 'ar') {
+            app()->setLocale('ar');
+        } else {
+            app()->setLocale('en');
+        }
+
+        try {
+
+            $validator = Validator::make($request->all(), [
+                'last_screen' => 'sometimes|string',
+                'lang' => 'required|string',
+                'user_id' => 'required|string',
+                'cart_id' => 'required|string',
+                'cart_currency' => 'required|string',
+                "discount_code"=> 'sometimes',
+                'cart_amount' => 'required',
+                'package_id' => 'sometimes|integer',
+                'start_date'=> ['sometimes']
+            ]);
+
+            if ($validator->fails()) {
+                return response()->json([
+                    'error' => 'Validation failed',
+                    'message' => $validator->errors(),
+                ], 400);
+            }
+
+            if(empty($request->package_id)){
+                return response()->json([
+                    "status" => false,
+                    "message" => "Package id not found."
+                ]);
+            }
+            if(empty($request->start_date)){
+                return response()->json([
+                    "status" => false,
+                    "message" => "Start date not found."
+                ]);
+            }
+
+            $user = User::findOrFail($request->user_id);
+
+            if (!empty($user)) {
+                $user->last_screen = $request->last_screen;
+                $user->update();
+            } else {
+                if (isset($request->lang) && $request->lang == 'ar') {
+                    return response()->json([
+                        "status" => false,
+                        "message" => "?? ??? ?????? ??? ????????."
+                    ]);
+                } else {
+                    return response()->json([
+                        "status" => false,
+                        "message" => "User not found."
+                    ]);
+                }
+            }
+
+            $selectedPackage = SelectedPackage::where('user_id', $request->input('user_id'))->first();
+            if(empty($selectedPackage)){
+                return response()->json([
+                    'status' => false,
+                    'message' => 'User package Not found',
+                    'upcoming_packages' => null,
+                    'package_info' => null
+                ], 200);
+            }
+
+            $upcoming_package = 0;
+            $add_meal = 0;
+            
+            $deliveries = Delivery::where('user_id', $request->input('user_id'))->first();
+
+            $status = 'pending';
+
+            if(isset($request->discount_code) && !empty($request->discount_code)){
+                $discount = Discount::where('code',$request->discount_code)->first();
+                $discount_id = (!empty($discount))?$discount->id:'';
+             }
+
+             $invoice = [];
+
+            $postData = [
+                'user_id' => $request->user_id,
+                'status' => $status,
+                'payment_status' => $status,
+                'payment_method' => "Paytab Payment",
+                'add_meals' => 0,
+                'upcoming_package' => 0,
+                'pt_invoice_id' => isset($responseData['tran_ref']) ? ('PT-'.$responseData['tran_ref']) : '',
+                'transaction_id' => isset($responseData['tran_ref']) ? $responseData['tran_ref'] : '',
+                'payment_id' => isset($responseData['tran_ref']) ? $responseData['tran_ref'] : '',
+                'created_at' => now()
+            ];
+        
+            if(isset($request->discount_code) && !empty($request->discount_code)){
+                $postData['discount_id'] = $discount_id;
+            }
+
+            $invoice = Invoice::create(
+                $postData
+            ); 
+
+         // Set your PayTabs profile ID and server key
+         $profileId = '139926';
+         $serverKey = 'S9J9NNNRJM-JHTHMDTT6H-KGL99LJJTT';
+ 
+         // API endpoint
+         $url = 'https://secure-global.paytabs.com/payment/request';
+ 
+         // Request data
+         $requestData = [
+             "profile_id" => $profileId,
+             "tran_type" => "auth",
+             "tran_class" => "ecom",
+             "cart_id" => $request->cart_id,
+             "cart_description" => "Food payment",
+             "cart_currency" => $request->cart_currency,
+             "cart_amount" => $request->cart_amount,
+             "callback" => url("/api/paytab/renewPackage/callback?invoice_id={$invoice->id}"),
+             "return" => url("/api/paytab/renewPackage/response?invoice_id={$invoice->id}")
+         ];
+ 
+         // Initialize cURL session
+         $ch = curl_init();
+ 
+         // Set cURL options
+         curl_setopt($ch, CURLOPT_URL, $url);
+         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+         curl_setopt($ch, CURLOPT_POST, true);
+         curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($requestData));
+         curl_setopt($ch, CURLOPT_HTTPHEADER, [
+             'Authorization: ' . $serverKey,
+             'Content-Type: application/json',
+         ]);
+ 
+         // Execute cURL request
+         $response = curl_exec($ch);
+ 
+         // Close cURL session
+         curl_close($ch);
+ 
+         // Handle the response
+         if ($response === false) {
+             // cURL error
+             $errorMessage = curl_error($ch);
+             return response()->json(['error' => $errorMessage], 500);
+         } else {
+             // Parse JSON response
+             $responseData = json_decode($response, true);
+             // Process the response data here
+
+           
+            Invoice::where('id', $invoice->id)->update([
+                'pt_invoice_id' => isset($responseData['tran_ref']) ? ('PT-'.$responseData['tran_ref']) : '',
+                'transaction_id' => isset($responseData['tran_ref']) ? $responseData['tran_ref'] : '',
+                'payment_id' => isset($responseData['tran_ref']) ? $responseData['tran_ref'] : '',
+            ]);
+
+            if($invoice->id){
+                    
+                // Verify that the provided package_id exists in the packages table
+                $package = Package::find($request->input('package_id'));
+
+                if ($package) {
+                    // Valid package_id provided, assign it to the user
+                    $user->package_id = $request->input('package_id');
+                    $user->update();
+
+                    $package = Package::find($request->input('package_id'));
+                    if (!empty($package)) {
+                        // Check if a record with the same user_id already exists
+                        $existingPackage = SelectedPackage::where('user_id', $request->input('user_id'))->first();
+                        if (!$existingPackage) {
+                            return response()->json([
+                                'error' => 'User package not found',
+                            ], 400);
+                        }
+
+                        $totalPrice = (array) $package->price;
+                        $totalPrice = array_sum($totalPrice);
+
+                        // Calculate the subscription ends date according to subscription start date and days from request
+                        $subscriptionStartDate = Carbon::createFromFormat('d-m-y', $request->input('start_date'));
+            
+                        $days = $package->total_days;   
+                        $delivery_time = $deliveries->time_of_delivery;
+                        $deliveryDays = $deliveries->delivery_days;
+        
+                        $skippedWeekdays = array_filter(array_keys($deliveryDays), function ($day) use ($deliveryDays) {
+                            return !($deliveryDays[$day]['val']['first'] === true);
+                        });
+        
+                        $dayNames = array_column($deliveryDays, 'key');
+                        $skippedWeekdays = array_map(function ($numericDay) use ($dayNames) {
+                            return $dayNames[$numericDay];
+                        }, $skippedWeekdays);
+        
+                        $subscriptionEndsDate = $subscriptionStartDate->copy();
+                        $deliveryCount = $days;
+        
+                        while ($deliveryCount > 1) {
+                            $subscriptionEndsDate->addDay();
+        
+                            if (in_array($subscriptionEndsDate->englishDayOfWeek, $skippedWeekdays)) {
+                                continue;
+                            }
+        
+                            $deliveryCount--;
+                        }
+            
+                        $subscriptionEndsDateFormatted = $subscriptionEndsDate->format('d-m-Y');
+                        $subscriptionStartDateFormatted = $subscriptionStartDate->format('d-m-Y');
+        
+                        $totalMeals = '';
+                        if(is_string($package->total_meals)){
+                            $totalMeals = json_decode($package->total_meals, true);
+                        }
+                        if(!empty($totalMeals) && is_string($totalMeals)){
+                            $totalMeals = json_decode($totalMeals, true);
+                        }
+                        if(!empty($totalMeals) && is_object($totalMeals)){
+                            $totalMeals = (array) $totalMeals;
+                        }else if(is_object($package->total_meals))
+                        {
+                            $totalMeals = (array) $package->total_meals;
+                        }
+
+                        if($package->is_custome_package == 0){
+                            $existingPackage->package_id = $package->id;
+                            $existingPackage->days = $package->total_days;
+                            $existingPackage->total_meals = json_encode($totalMeals);
+                            $existingPackage->total_calories = $package->total_calories;
+                            $existingPackage->total_price = $totalPrice;
+                            $existingPackage->subscription_start = $subscriptionStartDateFormatted;
+                            $existingPackage->subscription_ends = $subscriptionEndsDateFormatted;
+
+                            $existingPackage->save();
+                            
+                        }else{
+
+                            $existingPackage->package_id = $package->id;
+                            $existingPackage->days = $package->total_days;
+                            $existingPackage->total_meals = json_encode($totalMeals);
+                            $existingPackage->total_calories = $package->calories;
+                            $existingPackage->total_price = array_sum((array) $package->price);
+                            $existingPackage->subscription_start = $subscriptionStartDateFormatted;
+                            $existingPackage->subscription_ends = $subscriptionEndsDateFormatted;
+
+                            $existingPackage->save();
+                            
+                        }
+
+                        $invoice->update([
+                            'starting_date' => Carbon::parse($subscriptionStartDateFormatted)->format('Y-m-d'),
+                            'subscription_start' => $subscriptionStartDateFormatted,
+                            'subscription_end' => $subscriptionEndsDateFormatted,
+                        ]);
+
+                    }
+
+                } else {
+                    return response()->json([
+                        'error' => 'Invalid package_id',
+                    ], 400);
+                }
+            
+        }
+        
+            // Return a JSON response with the redirect URL.
+            return response()->json([
+                'redirect_url' => $responseData['redirect_url'],
+                'last_screen' => $user->last_screen,
+            ]);
+
+         }
+
+        } catch (Exception $e) {
+            // Return a JSON response with the error message.
+            return response()->json([
+                'error' => $e->getMessage(),
+            ], 400);
+        }
+  
+    }
+
+    // renew 
+
+    public function renewPaytabsResponse(Request $request){
+
+        $lang = 'en';
+   
+           if (isset($request->lang) && $request->lang == 'ar') {
+               app()->setLocale('ar');
+               $lang = 'ar';
+           } else {
+               app()->setLocale('en');
+           }
+   
+           try {
+
+               $id = $request->invoice_id;
+               $getUser = Invoice::where('id', $id)->first();
+               $user_id = $getUser->user_id;
+   
+               $user = User::findOrFail($user_id);
+                 
+               if (empty($user)) {
+                   if (isset($request->lang) && $request->lang == 'ar') {
+                       return response()->json([
+                           "status" => false,
+                           "message" => "?? ??? ?????? ??? ????????."
+                       ]);
+                   } else {
+                       return response()->json([
+                           "status" => false,
+                           "message" => "User not found."
+                       ]);
+                   }
+               }
+   
+               if (!empty($user)) {
+                   $user->last_screen = $request->last_screen;
+                   $user->update();
+               }
+
+               // Set your PayTabs profile ID and server key
+                $profileId = '139926';
+                $serverKey = 'S9J9NNNRJM-JHTHMDTT6H-KGL99LJJTT';
+
+                // API endpoint
+                $url = 'https://secure-global.paytabs.com/payment/query';
+
+                // Transaction reference
+                $tranRef = $getUser->transaction_id;
+
+                $data = array(
+                    "profile_id" => $profileId,
+                    "tran_ref" => $getUser->transaction_id
+                );
+                
+                // Convert data to JSON format
+                $postData = json_encode($data);
+                
+                // URL to send the request to
+                $url = "https://secure-global.paytabs.com/payment/query";
+                
+                // Set up cURL
+                $ch = curl_init($url);
+                
+                // Set up options for cURL
+                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "POST");
+                curl_setopt($ch, CURLOPT_POSTFIELDS, $postData);
+                curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+                    "Content-Type: application/json",
+                    "Authorization: ".$serverKey
+                ));
+                
+                // Execute the request and get the response
+                $response = curl_exec($ch);
+                $responseData = [];
+
+                // Check for errors
+                if ($response === false) {
+                    $error = curl_error($ch);
+                    // Handle cURL error
+                    echo "cURL Error: " . $error;
+                } else {
+                    // Decode the JSON response
+                    $responseData = json_decode($response, true);
+                    // Process the response data as needed
+                }
+
+                if($responseData['payment_result']['response_status'] == 'C'){
+                    // payment canceled  
+                    return response()->json([
+                        "status" => false,
+                        "message" => "Payment canceled."
+                    ]);
+                }
+   
+                if($responseData['payment_result']['response_status'] == 'D'){
+
+                    // Card security code (CVV) mismatch
+                    return response()->json([
+                        "status" => false,
+                        "message" => "Card security code (CVV) mismatch. Please try again after some time."
+                    ]);
+                }
+   
+               $created_at = Carbon::parse($responseData['payment_result']['transaction_time']);
+               $created_at = $created_at->format('Y-m-d');
+   
+               $selectedPackage = SelectedPackage::where('user_id', $user_id)->first();
+               $pendingInvoice = Invoice::where('id', $id)->first();
+   
+               $today = Carbon::now()->toDateString();
+                     
+                   $status = 'soon';
+   
+               if(!empty($selectedPackage->subscription_start)){
+                   if($today == Carbon::parse($selectedPackage->subscription_start)->format('Y-m-d')){
+                      $status = 'active';
+                   }
+               }
+   
+               $invoice = Invoice::updateOrCreate(
+                   ['id' => $id],
+                   [
+                       'user_id' => $user_id,
+                       'status' => $status,
+                       'payment_status' => $status,
+                       'amount' => isset($responseData['tran_total']) ? $responseData['tran_total'] : 0,
+                       'package_id' => $user->package_id,
+                       'currency' => $responseData['tran_currency'],
+                       'starting_date' => !empty($selectedPackage->subscription_start) ? Carbon::parse($selectedPackage->subscription_start)->format('Y-m-d') : NULL,
+                       'subscription_start' => isset($selectedPackage->subscription_start) ? Carbon::parse($selectedPackage->subscription_start)->format('Y-m-d') : NULL,
+                       'subscription_end' => isset($selectedPackage->subscription_ends) ? Carbon::parse($selectedPackage->subscription_ends)->format('Y-m-d') : NULL,
+                       'created_at' => isset($responseData['payment_result']['transaction_time']) ? $responseData['payment_result']['transaction_time'] : '',
+                       'is_payment_success' => 1
+                   ]
+               );
+   
+            Invoice::where('id',$id)->update(['is_payment_success' => 1]);
+            Invoice::where('id',$id)->update(['is_payment_success_renew_package' => 1]);
+   
+               return view('web.subscription.paytabsPayment.success', compact('lang'));
+             
+           } catch (Exception $e) {
+               // Return a generic error response.
+               return response()->json([
+                   'status' => false,
+                   'error' => $e->getMessage(),
+               ], 500);
+           }
+   
+           app()->setLocale('en');
+       
+    }
+
+    // renew
+
+    public function renewPaytabsCallback(Request $request){
+
+        $lang = 'en';
+
+        if (isset($request->lang) && $request->lang == 'ar') {
+            app()->setLocale('ar');
+            $lang = 'ar';
+        } else {
+            app()->setLocale('en');
+        }
+
+        try {
+                $id = $request->invoice_id;
+                $getUser = Invoice::where('id', $id)->first();
+                if(isset($getUser->user_id)){
+                $user_id = $getUser->user_id;
+    
+                $user = User::findOrFail($user_id);
+                    
+                if (empty($user)) {
+                    if (isset($request->lang) && $request->lang == 'ar') {
+                        return response()->json([
+                            "status" => false,
+                            "message" => "?? ??? ?????? ??? ????????."
+                        ]);
+                    } else {
+                        return response()->json([
+                            "status" => false,
+                            "message" => "User not found."
+                        ]);
+                    }
+                }
+                }
+    
+                if (!empty($user)) {
+                    $user->last_screen = $request->last_screen;
+                    $user->update();
+                }
+
+                // Set your PayTabs profile ID and server key
+                    $profileId = '139926';
+                    $serverKey = 'S9J9NNNRJM-JHTHMDTT6H-KGL99LJJTT';
+
+                    // API endpoint
+                    $url = 'https://secure-global.paytabs.com/payment/query';
+
+                    if(isset($getUser->transaction_id)){
+                    // Transaction reference
+                    $tranRef = $getUser->transaction_id;
+
+                    $data = array(
+                        "profile_id" => $profileId,
+                        "tran_ref" => $getUser->transaction_id
+                    );
+                    
+                    // Convert data to JSON format
+                    $postData = json_encode($data);
+                    
+                    // URL to send the request to
+                    $url = "https://secure-global.paytabs.com/payment/query";
+                    
+                    // Set up cURL
+                    $ch = curl_init($url);
+                    
+                    // Set up options for cURL
+                    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "POST");
+                    curl_setopt($ch, CURLOPT_POSTFIELDS, $postData);
+                    curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+                        "Content-Type: application/json",
+                        "Authorization: ".$serverKey
+                    ));
+                    
+                    // Execute the request and get the response
+                    $response = curl_exec($ch);
+                    $responseData = [];
+
+                    // Check for errors
+                    if ($response === false) {
+                        $error = curl_error($ch);
+                        // Handle cURL error
+                        echo "cURL Error: " . $error;
+                    } else {
+                        // Decode the JSON response
+                        $responseData = json_decode($response, true);
+                        // Process the response data as needed
+                    }
+                }
+
+                    if(isset($responseData['payment_result']['response_status']) && $responseData['payment_result']['response_status'] == 'C'){
+                        // payment canceled  
+                        return response()->json([
+                            "status" => false,
+                            "message" => "Payment canceled."
+                        ]);
+                    }
+    
+                    if(isset($responseData['payment_result']['response_status']) && $responseData['payment_result']['response_status'] == 'D'){
+                        // Card security code (CVV) mismatch
+                        return response()->json([
+                            "status" => false,
+                            "message" => "Card security code (CVV) mismatch. Please try again after some time."
+                        ]);
+                    }
+    
+
+            return response()->json([
+                "status" => true,
+                "message" => "You can navigate back to the app.",
+                'last_screen' => $user->last_screen,
+            ]);
+            
+        } catch (Exception $e) {
+            // Return a generic error response.
+            return response()->json([
+                'status' => false,
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+
+        app()->setLocale('en');
+    }
+
+    // renew
+
+    public function renewGetPaytabInvoice(Request $request)
+    {
+        if (isset($request->lang) && $request->lang == 'ar') {
+            app()->setLocale('ar');
+        } else {
+            app()->setLocale('en');
+        }
+
+        try {
+
+            $id = $request->user_id;
+
+            $user = User::findOrFail($id);
+
+            if (empty($user)) {
+                if (isset($request->lang) && $request->lang == 'ar') {
+                    return response()->json([
+                        "status" => false,
+                        "message" => "?? ??? ?????? ??? ????????."
+                    ]);
+                } else {
+                    return response()->json([
+                        "status" => false,
+                        "message" => "User not found."
+                    ]);
+                }
+            }
+
+            if (!empty($user)) {
+                $user->last_screen = $request->last_screen;
+                $user->update();
+            }
+
+            $invoice = Invoice::where('user_id', $id)->where('upcoming_package', 0)->latest()->first();
+
+            if (empty($invoice)) {
+                if (isset($request->lang) && $request->lang == 'ar') {
+                    return response()->json([
+                        "status" => false,
+                        "message" => "?? ??? ?????? ??? ?????? ????????."
+                    ]);
+                } else {
+                    return response()->json([
+                        "status" => false,
+                        "message" => "User's invoice not found."
+                    ]);
+                }
+            }
+
+            $selectedPackages = SelectedPackage::where('user_id', $request->user_id)->first();
+
+            if (isset($request->lang) && $request->lang == 'ar') {
+                return response()->json([
+                    "status" => true,
+                    "message" => "??? ??? ????? ????? ?????? ?? ?????. ????? ????? ??? ?????? ??????? ??? ???????.",
+                    'invoice_info' => $invoice,
+                    'user_info' => $user,
+                    'last_screen' => $user->last_screen,
+                ]);
+            } else {
+                return response()->json([
+                    "status" => true,
+                    "message" => "Your payment has been done successfully. You can close this page and go back to app.",
+                    'invoice_info' => $invoice,
+                    'user_info' => $user,
+                    'last_screen' => $user->last_screen,
+                ]);
+            }
+
+        } catch (Exception $e) {
+            // Return a generic error response.
+            return response()->json([
+                'status' => false,
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+
+        app()->setLocale('en');
+    }
+
+
+     // added meals
+
+     public function addedMealsPaytabPayment(Request $request){
+
+        if (isset($request->lang) && $request->lang == 'ar') {
+            app()->setLocale('ar');
+        } else {
+            app()->setLocale('en');
+        }
+
+        try {
+
+            $validator = Validator::make($request->all(), [
+                'last_screen' => 'sometimes|string',
+                'lang' => 'required|string',
+                'user_id' => 'required|string',
+                'cart_id' => 'required|string',
+                'cart_currency' => 'required|string',
+                "discount_code"=> 'sometimes',
+                'cart_amount' => 'required',
+                'starting_date' => 'required',
+                'meals' => 'required|array',
+            ]);
+
+            if ($validator->fails()) {
+                return response()->json([
+                    'error' => 'Validation failed',
+                    'message' => $validator->errors(),
+                ], 400);
+            }
+
+          
+            $user = User::where('id', $request->input('user_id'))->first();
+
+            if($user && $request->has('last_screen') && !empty($request->input('last_screen'))){
+                $user->last_screen = $request->input('last_screen');
+                $user->update();
+            }
+
+            $upcoming_package = 0;
+            $add_meal = 0;
+            
+            $selectedPackage = SelectedPackage::where('user_id', $request->input('user_id'))->first();
+
+            $status = 'pending';
+
+            if(isset($request->discount_code) && !empty($request->discount_code)){
+                $discount = Discount::where('code',$request->discount_code)->first();
+                $discount_id = (!empty($discount))?$discount->id:'';
+             }
+
+             $invoice = [];
+
+            $postData = [
+                'user_id' => $request->user_id,
+                'status' => $status,
+                'payment_status' => $status,
+                'payment_method' => "Paytab Payment",
+                'add_meals' => 1,
+                'upcoming_package' => 0,
+                'pt_invoice_id' => isset($responseData['tran_ref']) ? ('PT-'.$responseData['tran_ref']) : '',
+                'transaction_id' => isset($responseData['tran_ref']) ? $responseData['tran_ref'] : '',
+                'payment_id' => isset($responseData['tran_ref']) ? $responseData['tran_ref'] : '',
+                'created_at' => now()
+            ];
+        
+            if(isset($request->discount_code) && !empty($request->discount_code)){
+                $postData['discount_id'] = $discount_id;
+            }
+
+            $invoice = Invoice::create(
+                $postData
+            ); 
+
+         // Set your PayTabs profile ID and server key
+         $profileId = '139926';
+         $serverKey = 'S9J9NNNRJM-JHTHMDTT6H-KGL99LJJTT';
+ 
+         // API endpoint
+         $url = 'https://secure-global.paytabs.com/payment/request';
+ 
+         // Request data
+         $requestData = [
+             "profile_id" => $profileId,
+             "tran_type" => "auth",
+             "tran_class" => "ecom",
+             "cart_id" => $request->cart_id,
+             "cart_description" => "Food payment",
+             "cart_currency" => $request->cart_currency,
+             "cart_amount" => $request->cart_amount,
+             "callback" => url("/api/paytab/addedMeals/callback?invoice_id={$invoice->id}"),
+             "return" => url("/api/paytab/addedMeals/response?invoice_id={$invoice->id}")
+         ];
+ 
+         // Initialize cURL session
+         $ch = curl_init();
+ 
+         // Set cURL options
+         curl_setopt($ch, CURLOPT_URL, $url);
+         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+         curl_setopt($ch, CURLOPT_POST, true);
+         curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($requestData));
+         curl_setopt($ch, CURLOPT_HTTPHEADER, [
+             'Authorization: ' . $serverKey,
+             'Content-Type: application/json',
+         ]);
+ 
+         // Execute cURL request
+         $response = curl_exec($ch);
+ 
+         // Close cURL session
+         curl_close($ch);
+ 
+         // Handle the response
+         if ($response === false) {
+             // cURL error
+             $errorMessage = curl_error($ch);
+             return response()->json(['error' => $errorMessage], 500);
+         } else {
+             // Parse JSON response
+             $responseData = json_decode($response, true);
+             // Process the response data here
+
+           
+            Invoice::where('id', $invoice->id)->update([
+                'pt_invoice_id' => isset($responseData['tran_ref']) ? ('PT-'.$responseData['tran_ref']) : '',
+                'transaction_id' => isset($responseData['tran_ref']) ? $responseData['tran_ref'] : '',
+                'payment_id' => isset($responseData['tran_ref']) ? $responseData['tran_ref'] : '',
+            ]);
+
+                 /// 
+                 $added_meal_date = Carbon::parse(Carbon::createFromFormat('d-m-y', $request->input('starting_date')));
+ 
+                 $subscriptionEnd = Carbon::parse($selectedPackage->subscription_ends);
+ 
+                 $added_meals = [
+                    'starting_date' => $added_meal_date->format('d-m-Y'),
+                    'ending_date' => $subscriptionEnd->format('d-m-Y'),
+                    'number_of_days' => $added_meal_date->diffInDays($subscriptionEnd),
+                    'meals' => $request['meals']['breakfast_count']." Breakfast, ".$request['meals']['main_dish_count']." Main Dish, ".$request['meals']['side_items_count']." Side Items",
+                    'invoice_id' => $invoice->id,
+                    'breakfast_count' => $request['meals']['breakfast_count'],
+                    'main_dish_count' => $request['meals']['main_dish_count'],
+                    'side_items_count' => $request['meals']['side_items_count'],
+                 ];
+ 
+                 $selectedPackage = SelectedPackage::where('user_id', $request->user_id)->update([
+                     'add_meals' => 1,
+                     'added_meals' => json_encode($added_meals),
+                 ]);
+
+            // Return a JSON response with the redirect URL.
+            return response()->json([
+                'redirect_url' => $responseData['redirect_url'],
+                'last_screen' => $user->last_screen,
+            ]);
+
+         }
+
+        } catch (Exception $e) {
+            // Return a JSON response with the error message.
+            return response()->json([
+                'error' => $e->getMessage(),
+            ], 400);
+        }
+  
+    }
+
+    // added meals
+
+    public function addedMealsPaytabsResponse(Request $request){
+           $lang = 'en';
+   
+           if (isset($request->lang) && $request->lang == 'ar') {
+               app()->setLocale('ar');
+               $lang = 'ar';
+           } else {
+               app()->setLocale('en');
+           }
+   
+           try {
+               $id = $request->invoice_id;
+               $getUser = Invoice::where('id', $id)->first();
+               $user_id = $getUser->user_id;
+   
+               $user = User::findOrFail($user_id);
+                 
+               if (empty($user)) {
+                   if (isset($request->lang) && $request->lang == 'ar') {
+                       return response()->json([
+                           "status" => false,
+                           "message" => "?? ??? ?????? ??? ????????."
+                       ]);
+                   } else {
+                       return response()->json([
+                           "status" => false,
+                           "message" => "User not found."
+                       ]);
+                   }
+               }
+   
+               if (!empty($user)) {
+                   $user->last_screen = $request->last_screen;
+                   $user->update();
+               }
+
+               // Set your PayTabs profile ID and server key
+                $profileId = '139926';
+                $serverKey = 'S9J9NNNRJM-JHTHMDTT6H-KGL99LJJTT';
+
+                // API endpoint
+                $url = 'https://secure-global.paytabs.com/payment/query';
+
+                // Transaction reference
+                $tranRef = $getUser->transaction_id;
+
+                $data = array(
+                    "profile_id" => $profileId,
+                    "tran_ref" => $getUser->transaction_id
+                );
+                
+                // Convert data to JSON format
+                $postData = json_encode($data);
+                
+                // URL to send the request to
+                $url = "https://secure-global.paytabs.com/payment/query";
+                
+                // Set up cURL
+                $ch = curl_init($url);
+                
+                // Set up options for cURL
+                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "POST");
+                curl_setopt($ch, CURLOPT_POSTFIELDS, $postData);
+                curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+                    "Content-Type: application/json",
+                    "Authorization: ".$serverKey
+                ));
+                
+                // Execute the request and get the response
+                $response = curl_exec($ch);
+                $responseData = [];
+
+                // Check for errors
+                if ($response === false) {
+                    $error = curl_error($ch);
+                    // Handle cURL error
+                    echo "cURL Error: " . $error;
+                } else {
+                    // Decode the JSON response
+                    $responseData = json_decode($response, true);
+                    // Process the response data as needed
+                }
+
+                if($responseData['payment_result']['response_status'] == 'C'){
+                    // payment canceled  
+                    return response()->json([
+                        "status" => false,
+                        "message" => "Payment canceled."
+                    ]);
+                }
+   
+                if($responseData['payment_result']['response_status'] == 'D'){
+
+                    // Card security code (CVV) mismatch
+                    return response()->json([
+                        "status" => false,
+                        "message" => "Card security code (CVV) mismatch. Please try again after some time."
+                    ]);
+                }
+   
+               $created_at = Carbon::parse($responseData['payment_result']['transaction_time']);
+               $created_at = $created_at->format('Y-m-d');
+   
+               $selectedPackage = SelectedPackage::where('user_id', $user_id)->first();
+               $pendingInvoice = Invoice::where('id', $id)->first();
+   
+               $today = Carbon::now()->toDateString();
+                     
+                   $status = 'soon';
+   
+               if(!empty($selectedPackage->subscription_start)){
+                   if($today == Carbon::parse($selectedPackage->subscription_start)->format('Y-m-d')){
+                      $status = 'active';
+                   }
+               }
+   
+               $invoice = Invoice::updateOrCreate(
+                   ['id' => $id],
+                   [
+                       'user_id' => $user_id,
+                       'status' => $status,
+                       'payment_status' => $status,
+                       'amount' => isset($responseData['tran_total']) ? $responseData['tran_total'] : 0,
+                       'package_id' => $user->package_id,
+                       'currency' => $responseData['tran_currency'],
+                       'starting_date' => !empty($selectedPackage->subscription_start) ? Carbon::parse($selectedPackage->subscription_start)->format('Y-m-d') : NULL,
+                       'subscription_start' => isset($selectedPackage->subscription_start) ? Carbon::parse($selectedPackage->subscription_start)->format('Y-m-d') : NULL,
+                       'subscription_end' => isset($selectedPackage->subscription_ends) ? Carbon::parse($selectedPackage->subscription_ends)->format('Y-m-d') : NULL,
+                       'created_at' => isset($responseData['payment_result']['transaction_time']) ? $responseData['payment_result']['transaction_time'] : '',
+                   ]
+               );
+   
+               Invoice::where('id',$id)->update(['is_payment_success_add_meal' => 1]);
+   
+               return view('web.subscription.paytabsPayment.success', compact('lang'));
+             
+           } catch (Exception $e) {
+               // Return a generic error response.
+               return response()->json([
+                   'status' => false,
+                   'error' => $e->getMessage(),
+               ], 500);
+           }
+   
+           app()->setLocale('en');
+       
+    }
+
+    // added meals
+
+    public function addedMealsPaytabsCallback(Request $request){
+
+        $lang = 'en';
+
+        if (isset($request->lang) && $request->lang == 'ar') {
+            app()->setLocale('ar');
+            $lang = 'ar';
+        } else {
+            app()->setLocale('en');
+        }
+
+        try {
+                $id = $request->invoice_id;
+                $getUser = Invoice::where('id', $id)->first();
+                if(isset($getUser->user_id)){
+                $user_id = $getUser->user_id;
+    
+                $user = User::findOrFail($user_id);
+                    
+                if (empty($user)) {
+                    if (isset($request->lang) && $request->lang == 'ar') {
+                        return response()->json([
+                            "status" => false,
+                            "message" => "?? ??? ?????? ??? ????????."
+                        ]);
+                    } else {
+                        return response()->json([
+                            "status" => false,
+                            "message" => "User not found."
+                        ]);
+                    }
+                }
+                }
+    
+                if (!empty($user)) {
+                    $user->last_screen = $request->last_screen;
+                    $user->update();
+                }
+
+                // Set your PayTabs profile ID and server key
+                    $profileId = '139926';
+                    $serverKey = 'S9J9NNNRJM-JHTHMDTT6H-KGL99LJJTT';
+
+                    // API endpoint
+                    $url = 'https://secure-global.paytabs.com/payment/query';
+
+                    if(isset($getUser->transaction_id)){
+                    // Transaction reference
+                    $tranRef = $getUser->transaction_id;
+
+                    $data = array(
+                        "profile_id" => $profileId,
+                        "tran_ref" => $getUser->transaction_id
+                    );
+                    
+                    // Convert data to JSON format
+                    $postData = json_encode($data);
+                    
+                    // URL to send the request to
+                    $url = "https://secure-global.paytabs.com/payment/query";
+                    
+                    // Set up cURL
+                    $ch = curl_init($url);
+                    
+                    // Set up options for cURL
+                    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "POST");
+                    curl_setopt($ch, CURLOPT_POSTFIELDS, $postData);
+                    curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+                        "Content-Type: application/json",
+                        "Authorization: ".$serverKey
+                    ));
+                    
+                    // Execute the request and get the response
+                    $response = curl_exec($ch);
+                    $responseData = [];
+
+                    // Check for errors
+                    if ($response === false) {
+                        $error = curl_error($ch);
+                        // Handle cURL error
+                        echo "cURL Error: " . $error;
+                    } else {
+                        // Decode the JSON response
+                        $responseData = json_decode($response, true);
+                        // Process the response data as needed
+                    }
+                }
+
+                    if(isset($responseData['payment_result']['response_status']) && $responseData['payment_result']['response_status'] == 'C'){
+                        // payment canceled  
+                        return response()->json([
+                            "status" => false,
+                            "message" => "Payment canceled."
+                        ]);
+                    }
+    
+                    if(isset($responseData['payment_result']['response_status']) && $responseData['payment_result']['response_status'] == 'D'){
+                        // Card security code (CVV) mismatch
+                        return response()->json([
+                            "status" => false,
+                            "message" => "Card security code (CVV) mismatch. Please try again after some time."
+                        ]);
+                    }
+    
+
+            return response()->json([
+                "status" => true,
+                "message" => "You can navigate back to the app.",
+                'last_screen' => $user->last_screen,
+            ]);
+            
+        } catch (Exception $e) {
+            // Return a generic error response.
+            return response()->json([
+                'status' => false,
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+
+        app()->setLocale('en');
+    }
+
+    // added meals
+
+    public function getaddedMealsPaytabInvoice(Request $request)
+    {
+        if (isset($request->lang) && $request->lang == 'ar') {
+            app()->setLocale('ar');
+        } else {
+            app()->setLocale('en');
+        }
+
+        try {
+
+            $id = $request->user_id;
+
+            $user = User::findOrFail($id);
+
+            if (empty($user)) {
+                if (isset($request->lang) && $request->lang == 'ar') {
+                    return response()->json([
+                        "status" => false,
+                        "message" => "?? ??? ?????? ??? ????????."
+                    ]);
+                } else {
+                    return response()->json([
+                        "status" => false,
+                        "message" => "User not found."
+                    ]);
+                }
+            }
+
+            if (!empty($user)) {
+                $user->last_screen = $request->last_screen;
+                $user->update();
+            }
+
+            $invoice = Invoice::where('user_id', $id)->where('upcoming_package', 0)->where('add_meals', 1)->latest()->first();
+
+            if (empty($invoice)) {
+                if (isset($request->lang) && $request->lang == 'ar') {
+                    return response()->json([
+                        "status" => false,
+                        "message" => "?? ??? ?????? ??? ?????? ????????."
+                    ]);
+                } else {
+                    return response()->json([
+                        "status" => false,
+                        "message" => "User's invoice not found."
+                    ]);
+                }
+            }
+
+            $selectedPackages = SelectedPackage::where('user_id', $request->user_id)->first();
+
+            if (isset($request->lang) && $request->lang == 'ar') {
+                return response()->json([
+                    "status" => true,
+                    "message" => "??? ??? ????? ????? ?????? ?? ?????. ????? ????? ??? ?????? ??????? ??? ???????.",
+                    'invoice_info' => $invoice,
+                    'user_info' => $user,
+                    'last_screen' => $user->last_screen,
+                ]);
+            } else {
+                return response()->json([
+                    "status" => true,
+                    "message" => "Your payment has been done successfully. You can close this page and go back to app.",
+                    'invoice_info' => $invoice,
+                    'user_info' => $user,
+                    'last_screen' => $user->last_screen,
+                ]);
+            }
+
+        } catch (Exception $e) {
+            // Return a generic error response.
+            return response()->json([
+                'status' => false,
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+
+        app()->setLocale('en');
+    }
+
+   
+    public function index(Request $request)
+    {
+        $totalAmount=$request->totalAmount; 
+        $discount=$request->discount;
+        $discountAmount=$request->discountAmount;
+
+       try {
+        $paymentDetails = array(
+
+            //Customer's Personal Information
+            'cc_first_name' => "john",
+            //This will be prefilled as Credit Card First Name
+            'cc_last_name' => "Doe",
+            //This will be prefilled as Credit Card Last Name
+            'cc_phone_number' => "00973",
+            'phone_number' => "33333333",
+            'email' => "customer@gmail.com",
+
+            //Customer's Billing Address (All fields are mandatory)
+            //When the country is selected as USA or CANADA, the state field should contain a String of 2 characters containing the ISO state code otherwise the payments may be rejected.
+            //For other countries, the state can be a string of up to 32 characters.
+            'billing_address' => "manama bahrain",
+            'city' => "manama",
+            'state' => "manama",
+            'postal_code' => "00973",
+            'country' => "BHR",
+
+            //Customer's Shipping Address (All fields are mandatory)
+            'address_shipping' => "Juffair bahrain",
+            'city_shipping' => "manama",
+            'state_shipping' => "manama",
+            'postal_code_shipping' => "00973",
+            'country_shipping' => "BHR",
+
+            //Product Information
+            "products_per_title" => "Product1 || Product 2 || Product 4",
+            //Product title of the product. If multiple products then add “||” separator
+            'quantity' => "1 || 1 || 1",
+            //Quantity of products. If multiple products then add “||” separator
+            'unit_price' => "2 || 2 || 6",
+            //Unit price of the product. If multiple products then add “||” separator.
+            "other_charges" => "91.00",
+            //Additional charges. e.g.: shipping charges, taxes, VAT, etc.
+            'amount' => "101.00",
+            //Amount of the products and other charges, it should be equal to: amount = (sum of all products’ (unit_price * quantity)) + other_charges
+            'discount' => "1",
+            //Discount of the transaction. The Total amount of the invoice will be= amount - discount
+
+            //Invoice Information
+            'title' => "John Doe",
+            // Customer's Name on the invoice
+            "reference_no" => "1231231",
+            //Invoice reference number in your system
+
+            'profile_id' => '131737',
+            'merchant_key' => '73523',
+
+            // Merchant Information
+            'merchant_email' => 'Info@ghithaa.com',
+            // The email address associated with your PayTabs merchant account
+
+            'client_key' => "CGK2T6-RTRG6H-TT7KVG-HPM7H7",
+            'server_key' => "SGJ9MZKBZK-JHGGTKW6LH-MN96NGJRLL",
+
+            // 'secret_key' => "CMKMHP-VTGP6M-RKDQK2-DP7N9V",
+            // The secret key associated with your PayTabs merchant account
+
+        );
+        $result = Paytabs::getInstance()->create_pay_page($paymentDetails);
+      
+       }
+        catch (Exception $e) {
+            return response()->json([
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    
+        if (isset($result->response_code)) {
+            if ($result->response_code == 4012) {
+                return redirect($result->payment_url);
+            } elseif ($result->response_code == 4094) {
+                return response()->json([
+                    'error' => $result->details,
+                ], 400);
+            } else {
+                return response()->json([
+                    'message' => 'Unknown response code',
+                ], 500);
+            }
+        } else {
+            return response()->json([
+                'message' => 'provided data does not satisfy the requirements',
+            ], 500);
+        }
+
+    
+        $data = $result->result;
+    
+        return response()->json($data, 200);
+    }
+
+    public function response(Request $request)
+    {
+
+        $result = Paytabs::getInstance()->verify_payment($request->payment_reference);
+
+        if ($result->response_code == 100) {
+            //success
+            $this->createInvoice((array) $result);
+        }
+        return $result->result;
+    }
+
+    public function createInvoice($request)
+    {
+        $request['order_id'] = $request["reference_no"];
+        PaytabsInvoice::create($request);
+    }
+}
